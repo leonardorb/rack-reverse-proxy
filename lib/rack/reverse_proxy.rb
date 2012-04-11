@@ -12,19 +12,18 @@ module Rack
 
     def call(env)
       rackreq = Rack::Request.new(env)
-      matcher = get_matcher rackreq.fullpath
+      matcher = get_matcher rackreq
       return @app.call(env) if matcher.nil?
 
-      uri = matcher.get_uri(rackreq.fullpath,env)
+      uri = matcher.get_uri(rackreq.fullpath,rackreq.env)
       all_opts = @global_options.dup.merge(matcher.options)
       headers = Rack::Utils::HeaderHash.new
-      env.each { |key, value|
+      rackreq.env.each { |key, value|
         if key =~ /HTTP_(.*)/
           headers[$1] = value
         end
       }
       headers['HOST'] = uri.host if all_opts[:preserve_host]
- 
       session = Net::HTTP.new(uri.host, uri.port)
       session.read_timeout=all_opts[:timeout] if all_opts[:timeout]
 
@@ -35,7 +34,7 @@ module Rack
         # DO NOT DO THIS IN PRODUCTION !!!
         session.verify_mode = OpenSSL::SSL::VERIFY_NONE
       end
-      session.start { |http|
+      response = session.start { |http|
         m = rackreq.request_method
         case m
         when "GET", "HEAD", "DELETE", "OPTIONS", "TRACE"
@@ -60,21 +59,25 @@ module Rack
         end
 
         body = ''
-        res = http.request(req) do |res|
+        resp = http.request(req) do |res|
           res.read_body do |segment|
             body << segment
           end
         end
 
-        [res.code, create_response_headers(res), [body]]
+        {
+          :response => resp,
+          :body => [body]
+        }
       }
+      [response[:response].code, create_response_headers(response[:response]), response[:body]]
     end
 
     private
 
-    def get_matcher path
+    def get_matcher request
       matches = @matchers.select do |matcher|
-        matcher.match?(path)
+        matcher.match?(request)
       end
 
       if matches.length < 1
@@ -101,10 +104,11 @@ module Rack
       @global_options=options
     end
 
-    def reverse_proxy matcher, url, opts={}
+    def reverse_proxy matcher, url, condition=nil, opts={}
       raise GenericProxyURI.new(url) if matcher.is_a?(String) && url.is_a?(String) && URI(url).class == URI::Generic
-      @matchers << ReverseProxyMatcher.new(matcher,url,opts)
+      @matchers << ReverseProxyMatcher.new(matcher,url,condition,opts)
     end
+
   end
 
   class GenericProxyURI < Exception
@@ -131,24 +135,27 @@ module Rack
     end
 
     private
-
     def formatted_matches
       matches.map {|matcher| matcher.to_s}.join(', ')
     end
   end
 
   class ReverseProxyMatcher
-    def initialize(matching,url,options)
+    def initialize(matching,url,condition = nil,options = {})
       @matching=matching
       @url=url
+      @condition=condition
       @options=options
       @matching_regexp= matching.kind_of?(Regexp) ? matching : /^#{matching.to_s}/
     end
 
-    attr_reader :matching,:matching_regexp,:url,:options
+    attr_reader :matching,:matching_regexp,:url,:condition,:options
 
-    def match?(path)
-      match_path(path) ? true : false
+    def match?(request)
+      if !match_path(request.fullpath)
+        return false
+      end
+      match_request(request)
     end
 
     def get_uri(path,env)
@@ -168,6 +175,10 @@ module Rack
       path.match(matching_regexp)
     end
 
-
+    private
+    def match_request(request)
+      return condition.(request) if !condition.nil?
+      return true
+    end
   end
 end
